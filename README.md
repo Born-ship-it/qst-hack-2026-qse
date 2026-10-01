@@ -266,6 +266,123 @@ The notebook runs end to end in ~4–6 minutes on a laptop CPU (Intel/AMD,
 `qiskit.quantum_info.Statevector`. Swap in `StatevectorEstimator` +
 `EstimatorV2` for real-hardware execution.
 
+## Orbital-selection benchmarking study
+
+The `src/benchmark/` subpackage runs a systematic comparison of QSD
+algorithms across different **orbital-selection methods** (OVOS, COVO,
+RHF, AVAS, NO-MP2, …) on the same physical system. It answers a question
+that individual papers don't: *for a fixed QSD algorithm and a fixed
+quantum-resource budget, which orbital basis gives the best accuracy?*
+
+### Data layout
+
+```
+data/
+└── <molecule>/
+    └── <basis>/
+        └── <method>/
+            └── output/
+                ├── <config-a>/*.json
+                └── <config-b>/*.json
+```
+
+Examples:
+
+```
+data/h2/cc-pvdz/OVOS/output/initfock_virtual/*.json
+data/h2/cc-pvdz/COVO/output/aux1/reopt1/*.json
+data/h2/cc-pvdz/RHF/output/*.json
+```
+
+Each JSON must contain at minimum:
+
+```
+active_hf_energy                  # electronic frame
+active_mp2_correlation_energy     # electronic frame (for sanity check)
+nuclear_repulsion_energy
+one_electron_integrals
+two_electron_integrals
+casci_energy                      # total frame
+full_fci_energy                   # total frame
+```
+
+The loader warns (or fails, with `--strict`) if the CASCI energy deviates
+from the HF + MP2 + nuclear-repulsion reference by more than 0.1 Ha.
+
+### Running the study
+
+```bash
+# From the project root
+python scripts/benchmark_orbital_methods.py \
+    --data-dir data/h2/cc-pvdz \
+    --output-dir results/h2_ccpvdz \
+    --methods OVOS,COVO,RHF,AVAS,NO-MP2 \
+    --krylov-max 12 --workers 8
+```
+
+Options:
+
+| Flag | Effect |
+| :--- | :--- |
+| `--krylov-min` / `--krylov-max` / `--krylov-step` | Krylov dimension grid |
+| `--num-trotter-steps` | Trotter discretisation |
+| `--trotter-order` | 1 (Lie), 2 or 4 (Suzuki) |
+| `--num-samples` | SQD sampling budget |
+| `--transpile-level` | Qiskit `optimization_level` for synthesis |
+| `--workers N` | Parallel processes across runs |
+| `--force` | Ignore existing parquet checkpoint |
+| `--no-plots` | Skip figure generation |
+
+### Outputs
+
+```
+results/h2_ccpvdz/
+├── runs.parquet        # one row per (method, config, N_A)
+├── sweeps.parquet      # one row per (run, algorithm, R)
+├── synthesis_cache/    # qpy-cached Trotter circuits
+└── figures/
+    ├── fig01_accuracy_vs_ncas.png
+    ├── fig02_resource_scaling.png
+    ├── fig03_convergence_fixed_ncas.png
+    ├── fig04_rmin_over_rgs.png
+    ├── fig05_condition_number.png
+    ├── fig06_noise_robustness.png
+    ├── fig07_overlap_vs_rmin.png
+    ├── fig08_pareto_frontier.png
+    ├── fig09_runtime_breakdown.png
+    └── fig10_summary_heatmap.png
+```
+
+The two Parquet files let you regenerate figures without rerunning anything:
+
+```bash
+python scripts/plot_benchmark.py --output-dir results/h2_ccpvdz
+```
+
+### Speed notes
+
+- The **synthesis cache** (`qpy` files) makes reruns ~10× faster after the
+  first pass. Deleting the cache forces re-transpilation.
+- **Parquet checkpointing**: interrupted runs resume from where they stopped.
+  Use `--force` to start fresh.
+- **Parallelism** across runs is linear up to the number of physical cores.
+  Each worker uses a single thread; Qiskit circuits are picklable.
+
+### References for the figures
+
+| Figure | Inspired by |
+| :--- | :--- |
+| Fig 1 | Mikkelsen & Nakagawa, arXiv:2412.13839, Fig. 6 |
+| Fig 2 | Mikkelsen & Nakagawa, arXiv:2412.13839, Fig. 5c |
+| Fig 3 | Yu et al., arXiv:2501.09702, Fig. 3b |
+| Fig 4 | Mikkelsen & Nakagawa, arXiv:2412.13839, Fig. 5a |
+| Fig 5 | Stair et al., JCTC 16, 2236 (2020), Table 1 |
+| Fig 6 | O'Leary et al., Quantum 9, 1726 (2025), Fig. 3 |
+| Fig 7 | Epperly et al., SIAM J. Matrix Anal. 43, 1263 (2022), Thm 3.1 |
+| Fig 8 | Mikkelsen & Nakagawa, arXiv:2412.13839, Fig. 5 |
+| Fig 9 | Sugisaki et al., arXiv:2412.07218, runtime analysis |
+| Fig 10 | This work |
+
 ## Configuration parameters
 
 | Parameter | Typical value | Effect |
