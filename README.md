@@ -164,7 +164,7 @@ the OVOS active-space HF energy to `< 1e-12 Ha`.
 
 ### QSE vs SQD convergence
 
-![QSE vs SQD convergence on H₂/cc-pVDZ](docs/h2_qse_sqd_convergence.png)
+![QSE vs SQD convergence on H₂/cc-pVDZ](docs/h2_ovos_ncas_7_cc-pVDZ.png)
 
 *QSE (blue) converges monotonically from the HF reference toward the exact
 CASCI ground state as the Krylov dimension grows from 1 to 8. SQD (orange)
