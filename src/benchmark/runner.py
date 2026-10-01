@@ -22,11 +22,12 @@ from typing import Any
 
 import pandas as pd
 
+from .artifacts import save_exact, save_sweep
 from .discovery import OrbitalRun, discover_runs
 from .loader import load_run
 from .metrics import measure_accuracy
 from .resources import measure_resources
-from .sweeps import run_qse_sweep, run_sqd_sweep
+from .sweeps import build_exact_artifact, run_qse_sweep, run_sqd_sweep
 
 logger = logging.getLogger(__name__)
 
@@ -167,18 +168,20 @@ def _run_parallel(
 def _process_one_run(
     run: OrbitalRun, config: BenchmarkConfig,
 ) -> tuple[dict, list[dict]]:
-    """Load, measure, sweep, and return (runs_row, sweeps_rows)."""
+    """Load, measure, sweep, and save artifacts.  Returns (runs_row, sweeps_rows)."""
     loaded = load_run(run, strict=config.strict_sanity)
 
-    # Resource metrics
+    # --- Exact eigendecomposition → artifacts/exact/<key>.npz --------
+    exact_art = build_exact_artifact(loaded)
+    save_exact(config.output_dir, run.run_key, exact_art)
+
+    # --- Resource + accuracy summary (unchanged) ---------------------
     res = measure_resources(
         loaded,
         num_trotter_steps=config.num_trotter_steps,
         trotter_order=config.trotter_order,
         transpile_level=config.transpile_level,
     )
-
-    # Accuracy metrics
     acc = measure_accuracy(loaded)
 
     runs_row = {
@@ -192,39 +195,40 @@ def _process_one_run(
         **acc.to_row(),
     }
 
-    # Sweeps
-    sweep_rows: list[dict] = []
-    sweep_rows.extend(
-        row.to_row()
-        for row in run_qse_sweep(
-            loaded,
-            krylov_dims=config.krylov_dims,
-            num_trotter_steps=config.num_trotter_steps,
-            trotter_order=config.trotter_order,
-            threshold=config.threshold_qse,
-            transpile_level=config.transpile_level,
-            cache_dir=config.output_dir / "synthesis_cache",
-            verbose=config.verbose,
-        )
+    # --- QSE sweep → artifacts/sweeps_raw/<key>__QSE.npz -------------
+    qse_rows, qse_art = run_qse_sweep(
+        loaded,
+        krylov_dims=config.krylov_dims,
+        num_trotter_steps=config.num_trotter_steps,
+        trotter_order=config.trotter_order,
+        threshold=config.threshold_qse,
+        transpile_level=config.transpile_level,
+        cache_dir=config.output_dir / "synthesis_cache",
+        verbose=config.verbose,
     )
-    sweep_rows.extend(
-        row.to_row()
-        for row in run_sqd_sweep(
-            loaded,
-            krylov_dims=config.krylov_dims,
-            num_trotter_steps=config.num_trotter_steps,
-            trotter_order=config.trotter_order,
-            num_samples=config.num_samples,
-            threshold=config.threshold_sqd,
-            transpile_level=config.transpile_level,
-            cache_dir=config.output_dir / "synthesis_cache",
-            verbose=config.verbose,
-        )
-    )
+    save_sweep(config.output_dir, run.run_key, qse_art)
 
-    for row in sweep_rows:
-        row["method"] = run.method
-        row["config"] = run.config
+    # --- SQD sweep → artifacts/sweeps_raw/<key>__SQD.npz -------------
+    sqd_rows, sqd_art = run_sqd_sweep(
+        loaded,
+        krylov_dims=config.krylov_dims,
+        num_trotter_steps=config.num_trotter_steps,
+        trotter_order=config.trotter_order,
+        num_samples=config.num_samples,
+        threshold=config.threshold_sqd,
+        transpile_level=config.transpile_level,
+        cache_dir=config.output_dir / "synthesis_cache",
+        verbose=config.verbose,
+    )
+    save_sweep(config.output_dir, run.run_key, sqd_art)
+
+    # --- Flatten for Parquet -----------------------------------------
+    sweep_rows: list[dict] = []
+    for row in (*qse_rows, *sqd_rows):
+        d = row.to_row()
+        d["method"] = run.method
+        d["config"] = run.config
+        sweep_rows.append(d)
 
     return runs_row, sweep_rows
 
