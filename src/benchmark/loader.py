@@ -46,6 +46,7 @@ class LoadedRun:
     mp2_total: float | None
     casci_total: float
     fci_total: float | None
+    sanity_diff_ha: float          # |CASCI - (HF + MP2_corr + E_nuc)|
 
     # Integrals and metadata for later use
     dt: float  # auto time step pi / sum(|coeffs|)
@@ -94,7 +95,7 @@ def load_run(run: OrbitalRun, strict: bool = False) -> LoadedRun:
     fci_total = _optional_float(ovos.get("full_fci_energy"))
 
     # Sanity check
-    _check_sanity(
+    sanity_diff = _check_sanity(
         json_path=run.json_path,
         casci=casci_total,
         hf=hf_total,
@@ -118,6 +119,7 @@ def load_run(run: OrbitalRun, strict: bool = False) -> LoadedRun:
         mp2_total=mp2_total,
         casci_total=casci_total,
         fci_total=fci_total,
+        sanity_diff_ha=sanity_diff,
         dt=dt,
         nuclear_repulsion=nuclear_repulsion,
     )
@@ -152,14 +154,23 @@ def _check_sanity(
     hf: float,
     mp2: float | None,
     strict: bool,
-) -> None:
-    """Warn or raise if CASCI deviates from the HF + MP2 reference estimate."""
+) -> float:
+    """
+    Compare CASCI to the HF+MP2+E_nuc estimate and log the difference.
+
+    Always logs the difference at DEBUG so a sweep summary shows outliers.
+    Logs at WARNING above the threshold; raises if strict=True.
+
+    Returns the difference (nan if not computable).
+    """
     if np.isnan(casci) or mp2 is None:
-        return  # cannot check without both
+        return float("nan")
 
     diff = abs(casci - mp2)
+    logger.debug("%s: |CASCI - (HF+MP2+E_nuc)| = %.4f Ha", json_path, diff)
+
     if diff <= _SANITY_THRESHOLD_HA:
-        return
+        return diff
 
     msg = (
         f"{json_path}: CASCI ({casci:.6f}) deviates from active-space "
@@ -169,3 +180,6 @@ def _check_sanity(
     if strict:
         raise ValueError(msg)
     logger.warning(msg)
+    return diff
+
+

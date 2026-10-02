@@ -75,4 +75,6 @@ __all__ = [
     "plot_energy_convergence",
     "plot_comparison",
     "compute_energy_error",
+    "subspace_matrix_elements",
+    "diagonalize_two_electron_subspace",
 ]

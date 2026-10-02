@@ -1,11 +1,8 @@
 """
-Run QSE, SQD, and noise sweeps for a single LoadedRun.
+Run QSE and SQD sweeps for a single LoadedRun.
 
-All sweeps share a disk-backed synthesis cache so that expensive Trotter
-transpilations are done at most once per (run, Trotter params, transpile level).
-
-Each public function returns both the summary rows (for the Parquet files)
-and a rich artifact object (for sweeps_raw/*.npz).
+Both sweeps return ``(rows, artifact)``, where ``artifact`` is a padded
+:class:`SweepArtifact` ready to be written to disk.
 """
 
 from __future__ import annotations
@@ -20,11 +17,18 @@ from typing import Iterable
 import numpy as np
 from qiskit import QuantumCircuit, qpy, transpile
 from qiskit.circuit import Parameter
-from qiskit.quantum_info import SparsePauliOp, Statevector
+from qiskit.quantum_info import Statevector
 
 from ..circuits import build_trotter_circuit
-from ..utils import solve_thresholded_gevp
-from .artifacts import ExactArtifact, SweepArtifact
+from ..utils import solve_thresholded_gevp, subspace_matrix_elements
+from .artifacts import (
+    ExactArtifact,
+    SweepArtifact,
+    pack_coeffs,
+    pack_counts,
+    pack_matrices,
+    pack_subspaces,
+)
 from .loader import LoadedRun
 
 
@@ -33,7 +37,7 @@ DEFAULT_CACHE_DIR = Path(".cache/synthesis")
 
 
 # =====================================================================
-# Row schemas (unchanged)
+# Row schemas
 # =====================================================================
 
 @dataclass
@@ -55,21 +59,8 @@ class QSERow:
 
 
 @dataclass
-class SQDRow:
-    run_key: str
-    algorithm: str
-    krylov_dim: int
-    energy_total: float
-    err_vs_casci_mha: float
-    err_vs_fci_mha: float
-    correlation_captured_pct: float
-    condition_number: float
-    retained_dim: int
-    subspace_dim: int
-    runtime_seconds: float
-
-    def to_row(self) -> dict:
-        return asdict(self)
+class SQDRow(QSERow):
+    pass
 
 
 # =====================================================================
@@ -77,30 +68,23 @@ class SQDRow:
 # =====================================================================
 
 def build_exact_artifact(loaded: LoadedRun) -> ExactArtifact:
-    """Diagonalize the active-space 2e Hamiltonian and package it."""
-    from itertools import combinations
+    from ..utils import diagonalize_two_electron_subspace
 
-    n = loaded.num_qubits
-    n_elec = loaded.num_electrons
-    bitstrings = []
-    for occ in combinations(range(n), n_elec):
-        bits = ["0"] * n
-        for q in occ:
-            bits[n - 1 - q] = "1"
-        bitstrings.append("".join(bits))
-
-    h_mat, _ = _subspace_matrix_elements(loaded.hamiltonian, bitstrings)
-    evals, evecs = np.linalg.eigh(0.5 * (h_mat + h_mat.conj().T))
-
+    bitstrings, evals, evecs = diagonalize_two_electron_subspace(
+        loaded.hamiltonian, num_electrons=loaded.num_electrons,
+    )
     ref_idx = bitstrings.index(loaded.ref_bitstring)
-    hf_gs_overlap = float(abs(evecs[ref_idx, 0]) ** 2)
-
+    gs_degeneracy = int(np.sum(np.abs(evals - evals[0]) < 1e-6))
+    hf_gs_projection = float(
+        np.sum(np.abs(evecs[ref_idx, :gs_degeneracy]) ** 2)
+    )
     return ExactArtifact(
         bitstrings=bitstrings,
         evals=evals,
         evecs=evecs,
         ref_index=ref_idx,
-        hf_gs_overlap=hf_gs_overlap,
+        hf_gs_projection=hf_gs_projection,
+        gs_degeneracy=gs_degeneracy,
     )
 
 
@@ -118,7 +102,6 @@ def run_qse_sweep(
     cache_dir: Path = DEFAULT_CACHE_DIR,
     verbose: bool = False,
 ) -> tuple[list[QSERow], SweepArtifact]:
-    """Run a QSE sweep.  Returns (rows, artifact)."""
     from ..qse_baseline import QSESolver
 
     krylov_dims = sorted(krylov_dims)
@@ -135,7 +118,7 @@ def run_qse_sweep(
         threshold=threshold,
     )
     circuit = solver._build_circuit()
-    circuit_synth = _get_cached_synthesis(
+    circuit_synth = _load_or_build_synthesis(
         circuit,
         key=_synth_key(loaded, "qse", num_trotter_steps, trotter_order, transpile_level),
         cache_dir=cache_dir, transpile_level=transpile_level, verbose=verbose,
@@ -149,10 +132,11 @@ def run_qse_sweep(
     h_shifted_row[0] = solver.reference_energy - solver.shift_tau
 
     rows: list[QSERow] = []
-    energies_total: list[float] = []
+    energies: list[float] = []
     coeffs_list: list[np.ndarray] = []
     conds: list[float] = []
     retained_list: list[int] = []
+    requested = set(krylov_dims)
 
     for d in range(1, max_r):
         t_d = time.time()
@@ -163,13 +147,13 @@ def run_qse_sweep(
         h_shifted_row[d] = evs[2] + 1j * evs[3]
         d_seconds = time.time() - t_d
 
-        if (d + 1) not in krylov_dims:
+        if (d + 1) not in requested:
             continue
 
         r = d + 1
-        h_row = h_shifted_row[:r] + solver.shift_tau * s_row[:r]
+        h_row_r = h_shifted_row[:r] + solver.shift_tau * s_row[:r]
         s_mat = _toeplitz(s_row[:r])
-        h_mat = _toeplitz(h_row)
+        h_mat = _toeplitz(h_row_r)
 
         cond = _condition_number(s_mat)
         try:
@@ -182,22 +166,24 @@ def run_qse_sweep(
             coeffs = np.array([])
             retained = 0
 
-        rows.append(_make_qse_row(
-            loaded=loaded, krylov_dim=r, energy_total=e_total,
-            cond=cond, retained=retained, runtime=d_seconds,
+        rows.append(_make_row(
+            loaded, "QSE", r, e_total, cond, retained, r, d_seconds,
         ))
-        energies_total.append(e_total)
+        energies.append(e_total)
         coeffs_list.append(coeffs)
         conds.append(cond)
         retained_list.append(retained)
 
+    coeffs_padded, coeff_lens = pack_coeffs(coeffs_list)
+
     artifact = SweepArtifact(
         algorithm="QSE",
-        krylov_dims=np.array(sorted(krylov_dims)),
-        energies_total=np.array(energies_total),
-        coeffs=coeffs_list,
-        condition_numbers=np.array(conds),
-        retained_dims=np.array(retained_list),
+        krylov_dims=np.asarray(krylov_dims),
+        energies_total=np.asarray(energies),
+        condition_numbers=np.asarray(conds),
+        retained_dims=np.asarray(retained_list),
+        coeffs=coeffs_padded,
+        coeff_lens=coeff_lens,
         s_row=s_row,
         h_row=h_shifted_row + solver.shift_tau * s_row,
     )
@@ -220,7 +206,6 @@ def run_sqd_sweep(
     cache_dir: Path = DEFAULT_CACHE_DIR,
     verbose: bool = False,
 ) -> tuple[list[SQDRow], SweepArtifact]:
-    """Run a cumulative SQD sweep.  Returns (rows, artifact)."""
     from ..sqd_enhanced import SQDSolver
 
     krylov_dims = sorted(krylov_dims)
@@ -251,7 +236,7 @@ def run_sqd_sweep(
     qc.compose(loaded.reference_circuit, inplace=True)
     qc.compose(evolution, inplace=True)
 
-    qc_synth = _get_cached_synthesis(
+    qc_synth = _load_or_build_synthesis(
         qc,
         key=_synth_key(loaded, "sqd", num_trotter_steps, trotter_order, transpile_level),
         cache_dir=cache_dir, transpile_level=transpile_level, verbose=verbose,
@@ -262,14 +247,15 @@ def run_sqd_sweep(
     aggregated_counts: Counter = Counter()
 
     rows: list[SQDRow] = []
-    energies_total: list[float] = []
+    energies: list[float] = []
     coeffs_list: list[np.ndarray] = []
     conds: list[float] = []
     retained_list: list[int] = []
-    per_d_bitstrings: list[list[str]] = []
-    per_d_H: list[np.ndarray] = []
-    per_d_S: list[np.ndarray] = []
-    per_d_counts: list[dict[str, int]] = []
+    per_step_bs: list[list[str]] = []
+    per_step_H: list[np.ndarray] = []
+    per_step_S: list[np.ndarray] = []
+    per_step_counts: list[dict[str, int]] = []
+    requested = set(krylov_dims)
 
     for d in range(1, max_r):
         t_d = time.time()
@@ -285,11 +271,11 @@ def run_sqd_sweep(
         aggregated_counts.update(counts)
         d_seconds = time.time() - t_d
 
-        if (d + 1) not in krylov_dims:
+        if (d + 1) not in requested:
             continue
 
         bitstrings = sorted(all_bitstrings)
-        h_mat, s_mat = _subspace_matrix_elements(loaded.hamiltonian, bitstrings)
+        h_mat, s_mat = subspace_matrix_elements(loaded.hamiltonian, bitstrings)
         cond = _condition_number(s_mat)
         try:
             e_elec, coeffs, retained = solve_thresholded_gevp(
@@ -301,54 +287,79 @@ def run_sqd_sweep(
             coeffs = np.array([])
             retained = 0
 
-        rows.append(_make_sqd_row(
-            loaded=loaded, krylov_dim=d + 1, energy_total=e_total,
-            cond=cond, retained=retained, subspace_dim=len(bitstrings),
-            runtime=d_seconds,
+        rows.append(_make_row(
+            loaded, "SQD", d + 1, e_total, cond, retained,
+            subspace_dim=len(bitstrings), runtime=d_seconds,
         ))
-        energies_total.append(e_total)
+        energies.append(e_total)
         coeffs_list.append(coeffs)
         conds.append(cond)
         retained_list.append(retained)
-        per_d_bitstrings.append(bitstrings)
-        per_d_H.append(h_mat)
-        per_d_S.append(s_mat)
-        per_d_counts.append(dict(aggregated_counts))
+        per_step_bs.append(bitstrings)
+        per_step_H.append(h_mat)
+        per_step_S.append(s_mat)
+        per_step_counts.append(dict(aggregated_counts))
+
+    coeffs_padded, coeff_lens = pack_coeffs(coeffs_list)
+    union_bs, subspace_index, subspace_sizes = pack_subspaces(per_step_bs)
+    subspace_H = pack_matrices(per_step_H)
+    subspace_S = pack_matrices(per_step_S)
+    counts_matrix = pack_counts(per_step_counts, union_bs)
 
     artifact = SweepArtifact(
         algorithm="SQD",
-        krylov_dims=np.array(sorted(krylov_dims)),
-        energies_total=np.array(energies_total),
-        coeffs=coeffs_list,
-        condition_numbers=np.array(conds),
-        retained_dims=np.array(retained_list),
-        subspace_bitstrings=per_d_bitstrings,
-        subspace_H=per_d_H,
-        subspace_S=per_d_S,
-        sampled_counts=per_d_counts,
+        krylov_dims=np.asarray(krylov_dims),
+        energies_total=np.asarray(energies),
+        condition_numbers=np.asarray(conds),
+        retained_dims=np.asarray(retained_list),
+        coeffs=coeffs_padded,
+        coeff_lens=coeff_lens,
+        union_bitstrings=union_bs,
+        subspace_index=subspace_index,
+        subspace_sizes=subspace_sizes,
+        subspace_H=subspace_H,
+        subspace_S=subspace_S,
+        sampled_counts=counts_matrix,
     )
     return rows, artifact
 
 
 # =====================================================================
-# Internal helpers (unchanged from previous version)
+# Synthesis cache
 # =====================================================================
 
-def _synth_key(loaded, tag, num_trotter_steps, trotter_order, level) -> str:
+def synthesis_cache_path(
+    cache_dir: Path, key: str,
+) -> Path:
+    return cache_dir / f"{key}.qpy"
+
+
+def synthesis_key(
+    loaded: LoadedRun, tag: str, num_trotter_steps: int,
+    trotter_order: int, transpile_level: int,
+) -> str:
     raw = (
         f"{loaded.meta.run_key}|{tag}|{num_trotter_steps}|"
-        f"{trotter_order}|{level}|{loaded.num_qubits}"
+        f"{trotter_order}|{transpile_level}|{loaded.num_qubits}"
     )
     digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
     return f"{loaded.meta.method}_{loaded.num_qubits}q_{tag}_{digest}"
 
 
-def _get_cached_synthesis(
+_synth_key = synthesis_key  # local alias
+
+
+def _load_or_build_synthesis(
     circuit: QuantumCircuit, key: str, cache_dir: Path,
     transpile_level: int, verbose: bool,
 ) -> QuantumCircuit:
+    """Load a cached Trotter circuit, synthesizing and caching if needed.
+
+    Callers must serialize access to the cache directory; see runner.py
+    for the pre-synthesis pass that guarantees this.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"{key}.qpy"
+    cache_file = synthesis_cache_path(cache_dir, key)
     if cache_file.exists():
         if verbose:
             print(f"    [cache hit] {cache_file.name}")
@@ -362,10 +373,17 @@ def _get_cached_synthesis(
     if verbose:
         print(f"      → {time.time() - t0:.1f}s, "
               f"depth {qc_synth.depth()}, size {qc_synth.size()}")
-    with open(cache_file, "wb") as f:
+    # Atomic write: write to a tmp file then rename
+    tmp = cache_file.with_suffix(".qpy.tmp")
+    with open(tmp, "wb") as f:
         qpy.dump(qc_synth, f)
+    tmp.replace(cache_file)
     return qc_synth
 
+
+# =====================================================================
+# Small helpers
+# =====================================================================
 
 def _toeplitz(first_row: np.ndarray) -> np.ndarray:
     import scipy.linalg as la
@@ -380,61 +398,11 @@ def _condition_number(s_mat: np.ndarray) -> float:
     return float(pos[-1] / pos[0])
 
 
-def _subspace_matrix_elements(
-    hamiltonian: SparsePauliOp, bitstrings: list[str],
-) -> tuple[np.ndarray, np.ndarray]:
-    dim = len(bitstrings)
-    h_mat = np.zeros((dim, dim), dtype=complex)
-    s_mat = np.eye(dim, dtype=complex)
-    n = hamiltonian.num_qubits
-    for i, bra_bs in enumerate(bitstrings):
-        for j, ket_bs in enumerate(bitstrings):
-            if i == j:
-                h_mat[i, j] = _diag_energy(hamiltonian, bra_bs)
-            else:
-                h_mat[i, j] = _off_diag_energy(hamiltonian, n, bra_bs, ket_bs)
-    return h_mat, s_mat
-
-
-def _diag_energy(op: SparsePauliOp, bitstring: str) -> complex:
-    state = int(bitstring, 2)
-    e = 0.0 + 0.0j
-    for pauli, coeff in zip(op.paulis, op.coeffs):
-        label = pauli.to_label()
-        if all(c in "IZ" for c in label):
-            sign = 1.0
-            for i, c in enumerate(reversed(label)):
-                if c == "Z":
-                    sign *= (-1.0) ** ((state >> i) & 1)
-            e += coeff * sign
-    return e
-
-
-def _off_diag_energy(op, n, bra_bs, ket_bs) -> complex:
-    bra, ket = int(bra_bs, 2), int(ket_bs, 2)
-    val = 0.0 + 0.0j
-    for pauli, coeff in zip(op.paulis, op.coeffs):
-        label = pauli.to_label()
-        new_state = ket
-        phase = 1.0 + 0.0j
-        for q in range(n):
-            p = label[n - 1 - q]
-            if p == "I":
-                continue
-            elif p == "Z":
-                if (new_state >> q) & 1:
-                    phase *= -1
-            elif p == "X":
-                new_state ^= 1 << q
-            elif p == "Y":
-                phase *= 1j if not ((new_state >> q) & 1) else -1j
-                new_state ^= 1 << q
-        if new_state == bra:
-            val += coeff * phase
-    return val
-
-
-def _make_qse_row(loaded, krylov_dim, energy_total, cond, retained, runtime):
+def _make_row(
+    loaded: LoadedRun, algorithm: str, krylov_dim: int,
+    energy_total: float, cond: float, retained: int,
+    subspace_dim: int, runtime: float,
+) -> QSERow:
     err_casci = (energy_total - loaded.casci_total) * 1000.0
     err_fci = ((energy_total - loaded.fci_total) * 1000.0
                if loaded.fci_total is not None else float("nan"))
@@ -442,26 +410,15 @@ def _make_qse_row(loaded, krylov_dim, energy_total, cond, retained, runtime):
     captured = (100.0 * (loaded.hf_total - energy_total) / corr
                 if abs(corr) > 1e-12 else float("nan"))
     return QSERow(
-        run_key=loaded.meta.run_key, algorithm="QSE", krylov_dim=krylov_dim,
-        energy_total=energy_total, err_vs_casci_mha=err_casci,
-        err_vs_fci_mha=err_fci, correlation_captured_pct=captured,
-        condition_number=cond, retained_dim=retained, subspace_dim=krylov_dim,
-        runtime_seconds=runtime,
-    )
-
-
-def _make_sqd_row(loaded, krylov_dim, energy_total, cond, retained,
-                  subspace_dim, runtime):
-    err_casci = (energy_total - loaded.casci_total) * 1000.0
-    err_fci = ((energy_total - loaded.fci_total) * 1000.0
-               if loaded.fci_total is not None else float("nan"))
-    corr = loaded.hf_total - loaded.casci_total
-    captured = (100.0 * (loaded.hf_total - energy_total) / corr
-                if abs(corr) > 1e-12 else float("nan"))
-    return SQDRow(
-        run_key=loaded.meta.run_key, algorithm="SQD", krylov_dim=krylov_dim,
-        energy_total=energy_total, err_vs_casci_mha=err_casci,
-        err_vs_fci_mha=err_fci, correlation_captured_pct=captured,
-        condition_number=cond, retained_dim=retained, subspace_dim=subspace_dim,
+        run_key=loaded.meta.run_key,
+        algorithm=algorithm,
+        krylov_dim=krylov_dim,
+        energy_total=energy_total,
+        err_vs_casci_mha=err_casci,
+        err_vs_fci_mha=err_fci,
+        correlation_captured_pct=captured,
+        condition_number=cond,
+        retained_dim=retained,
+        subspace_dim=subspace_dim,
         runtime_seconds=runtime,
     )

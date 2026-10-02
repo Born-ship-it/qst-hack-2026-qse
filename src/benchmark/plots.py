@@ -73,34 +73,62 @@ def fig02_resource_scaling(runs: pd.DataFrame, out: Path) -> None:
 def fig03_convergence_fixed_ncas(
     runs: pd.DataFrame, sweeps: pd.DataFrame, out: Path, ncas: int = 6,
 ) -> None:
-    """QSE + SQD convergence for each method at a fixed active-space size."""
+    """
+    Two-panel figure: absolute quality (vs FCI) and within-method
+    convergence (vs CASCI), for each method at a fixed active-space size.
+
+    The two panels answer different questions:
+    - left:  "which method gives the best answer overall?"
+    - right: "how fast does each method converge to its own CASCI limit?"
+    """
     target_qubits = 2 * ncas
     subset_runs = runs[runs["num_qubits"] == target_qubits]
     if subset_runs.empty:
-        return  # no runs at this size
+        return
 
     methods = sorted(subset_runs["method"].unique())
     n = len(methods)
     cols = min(3, n)
     rows = (n + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows),
-                             squeeze=False)
+    fig, axes = plt.subplots(
+        2, rows * cols,
+        figsize=(5 * rows * cols / 2, 8), squeeze=False,
+    )
 
-    for ax, method in zip(axes.flat, methods):
+    for col, method in enumerate(methods):
         keys = subset_runs[subset_runs["method"] == method]["run_key"]
         sub = sweeps[sweeps["run_key"].isin(keys)]
+
         for algo, algo_sub in sub.groupby("algorithm"):
             algo_sub = algo_sub.sort_values("krylov_dim")
-            ax.plot(algo_sub["krylov_dim"], algo_sub["err_vs_casci_mha"],
-                    marker="o", linewidth=2, color=algo_color(algo),
-                    label=algo)
-        add_chemical_accuracy_line(ax, 1.0)
-        style_axes(ax, "Krylov dimension R", "Error vs CASCI (mHa)",
-                   title=f"{method}  (N_A={ncas})", logy=True)
-        ax.legend(fontsize=9)
+            for row, (metric, label) in enumerate((
+                ("err_vs_fci_mha",    "Error vs FCI (mHa)"),
+                ("err_vs_casci_mha",  "Error vs CASCI (mHa)"),
+            )):
+                ax = axes[row, col]
+                ax.plot(algo_sub["krylov_dim"], algo_sub[metric],
+                        marker="o", linewidth=2, color=algo_color(algo),
+                        label=algo)
+
+        for row in range(2):
+            ax = axes[row, col]
+            add_chemical_accuracy_line(ax, 1.0)
+            style_axes(
+                ax, "Krylov dimension R",
+                "Error vs FCI (mHa)" if row == 0 else "Error vs CASCI (mHa)",
+                title=f"{method}  (N_A={ncas})" if row == 0 else None,
+                logy=True,
+            )
+            ax.legend(fontsize=9)
+
+    # Hide unused subplots
+    for i in range(n, rows * cols):
+        for row in range(2):
+            axes[row, i].set_visible(False)
 
     fig.tight_layout()
     save_figure(fig, out)
+
 
 
 # =====================================================================
@@ -373,14 +401,26 @@ ALL_FIGURES = [
 ]
 
 
+# Narrow the exceptions caught by generate_all
+_OPTIONAL_FIGURE_EXCEPTIONS = (
+    FileNotFoundError,        # optional inputs like noise.parquet
+    KeyError,                 # a column missing from an optional dataframe
+    ValueError,               # e.g. no rows at the requested N_A
+)
+
+
 def generate_all(
     runs: pd.DataFrame, sweeps: pd.DataFrame, out_dir: Path,
 ) -> None:
-    """Generate every available figure, skipping those whose inputs are missing."""
+    """
+    Generate every figure, skipping only the ones whose optional inputs
+    are missing. Programming errors (TypeError, AttributeError, etc.)
+    propagate so they are not lost.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     for name, fn in ALL_FIGURES:
         path = out_dir / name
         try:
             fn(runs, sweeps, path)
-        except Exception as exc:
-            print(f"[skip] {name}: {exc}")
+        except _OPTIONAL_FIGURE_EXCEPTIONS as exc:
+            print(f"[skip] {name}: {type(exc).__name__}: {exc}")

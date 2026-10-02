@@ -1,0 +1,198 @@
+# =====================================================================
+# Python
+# =====================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
+
+# =====================================================================
+# Virtual environments
+# =====================================================================
+.venv/
+venv/
+ENV/
+env/
+.venv-win/
+.venv-linux/
+
+# Tool-managed env metadata
+.python-version
+.direnv/
+.envrc
+
+# =====================================================================
+# Jupyter / IPython
+# =====================================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+.ipython/
+
+# =====================================================================
+# Testing and coverage
+# =====================================================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# =====================================================================
+# Linting / type-checking caches
+# =====================================================================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# =====================================================================
+# Project artefacts — the big ones
+# =====================================================================
+# QSD synthesis cache (qpy files, content-addressed, regenerable)
+.cache/
+**/synthesis_cache/
+*.qpy.tmp
+*.qpy.partial
+
+# Benchmark results (parquet, npz, figures) — always regenerable
+# results/
+# **/results/
+
+# =====================================================================
+# Manim intermediate output (mp4 and partial renders);
+# final GIFs in media/output/ ARE tracked
+# =====================================================================
+# Match at any depth in case manim is run from inside media/
+**/videos/
+**/partial_movie_files/
+**/Tex/
+**/texts/
+media/output/*.mp4
+media/output/*.webm
+
+# =====================================================================
+# Data — keep small samples, ignore large runs
+# =====================================================================
+# Keep the directory structure
+!data/.gitkeep
+
+# NOTE: no blanket ignore on data/**/*.json — every JSON in data/ is
+# tracked by default. If you start adding large files and want to
+# selectively track only small examples, restore the pattern below and
+# un-comment the specific negations.
+#
+# data/**/*.json
+# !data/h2_ovos.json
+# !data/examples/
+
+data/**/*.parquet
+data/**/*.npz
+data/**/*.h5
+
+# =====================================================================
+# IDE / editor
+# =====================================================================
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.vim/
+.viminfo
+.netrwhist
+.project
+.pydevproject
+.settings/
+
+# Emacs
+#*#
+.#*
+.\#*
+.dir-locals.el
+.projectile
+*~
+
+# VS Code local history
+.history/
+
+# =====================================================================
+# Operating systems
+# =====================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# WSL/Windows zone metadata
+*:Zone.Identifier
+*Zone.Identifier
+
+# =====================================================================
+# Environment and secrets
+# =====================================================================
+.env
+.env.local
+.env.*.local
+*.pem
+secrets.json
+api_tokens.json
+
+# =====================================================================
+# Logs and runtime output
+# =====================================================================
+*.log
+nohup.out
+manim.log
+slurm-*.out
+.slurm/
+
+# =====================================================================
+# Backups, patches, and editor crash files
+# =====================================================================
+*.bak
+*.orig
+*.rej
+*.tmp
+
+# =====================================================================
+# Build artefacts from docs
+# =====================================================================
+site/
+docs/_build/
+
+# =====================================================================
+# Manim config (personal render preferences)
+# =====================================================================
+manim.cfg

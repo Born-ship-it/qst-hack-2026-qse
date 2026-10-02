@@ -89,11 +89,11 @@ qse_project/
 │   └── .gitkeep                    # OVOS JSON files live here
 ├── docs/
 │   └── h2_qse_sqd_convergence.png
+├── media/                          # GIFs and other media for the README
 ├── notebooks/
 │   └── main_analysis.ipynb         # end-to-end demo
-├── slides/
-│   └── presentation.html           # for the interview
 └── src/
+    ├── benchmark/                  # orbital-selection benchmarking study
     ├── __init__.py                 # package exports
     ├── hamiltonian.py              # Heisenberg + molecular Hamiltonians
     ├── circuits.py                 # Trotter + swap-test circuits
@@ -102,6 +102,31 @@ qse_project/
     ├── sqd_enhanced.py             # SQDSolver (fast + primitive paths)
     └── utils.py                    # GEVP, exact diagonalization, plots
 ```
+
+## Pipeline overview
+
+![QSE pipeline](media/output/workflow.gif)
+
+*From molecule to OVOS compression to qubit Hamiltonian to QSE/SQD
+diagonalization. Classical stages are shown in blue/green, quantum
+stages in yellow/orange.*
+
+### Quantum Subspace Expansion (QSE)
+
+![QSE animation](media/output/qse_animation.gif)
+
+*QSE builds a Krylov basis from time-evolved reference states, measures
+the projected H and S matrices via an extended swap test, and solves the
+GEVP classically. The convergence curve (bottom) shows the monotone
+decrease from the HF reference toward the exact CASCI energy.*
+
+### Sample-Based Quantum Diagonalization (SQD)
+
+![SQD animation](media/output/sqd_animation.gif)
+
+*SQD samples bitstrings from the time-evolved state, builds the subspace
+from the observed configurations, and diagonalizes the projected
+Hamiltonian classically. No swap test, no ancillary qubits.*
 
 ## Methods
 

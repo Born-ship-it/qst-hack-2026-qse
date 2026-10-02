@@ -105,57 +105,10 @@ class SQDSolver:
     # ------------------------------------------------------------------
     # Subspace matrices
     # ------------------------------------------------------------------
-    def _diag_energy(self, bitstring: str) -> float:
-        state = int(bitstring, 2)
-        e = 0.0
-        for pauli, coeff in zip(self.hamiltonian.paulis, self.hamiltonian.coeffs):
-            label = pauli.to_label()
-            if all(c in "IZ" for c in label):
-                sign = 1.0
-                for i, c in enumerate(reversed(label)):
-                    if c == "Z":
-                        sign *= (-1.0) ** ((state >> i) & 1)
-                e += coeff.real * sign
-        return e
-
-    def _off_diag_energy(self, bra_bs: str, ket_bs: str) -> complex:
-        bra = int(bra_bs, 2)
-        ket = int(ket_bs, 2)
-        val = 0.0 + 0.0j
-        n = self.num_qubits
-        for pauli, coeff in zip(self.hamiltonian.paulis, self.hamiltonian.coeffs):
-            label = pauli.to_label()
-            new_state = ket
-            phase = 1.0 + 0.0j
-            for q in range(n):
-                p = label[n - 1 - q]
-                if p == "I":
-                    continue
-                elif p == "Z":
-                    if (new_state >> q) & 1:
-                        phase *= -1
-                elif p == "X":
-                    new_state ^= 1 << q
-                elif p == "Y":
-                    phase *= 1j if not ((new_state >> q) & 1) else -1j
-                    new_state ^= 1 << q
-            if new_state == bra:
-                val += coeff * phase
-        return val
-
-    def _compute_subspace_matrix_elements(
-        self, bitstrings: list[str],
-    ) -> tuple[np.ndarray, np.ndarray]:
-        dim = len(bitstrings)
-        h_mat = np.zeros((dim, dim), dtype=complex)
-        s_mat = np.eye(dim, dtype=complex)
-        for i, bra in enumerate(bitstrings):
-            for j, ket in enumerate(bitstrings):
-                if i == j:
-                    h_mat[i, j] = self._diag_energy(bra)
-                else:
-                    h_mat[i, j] = self._off_diag_energy(bra, ket)
-        return h_mat, s_mat
+    def _compute_subspace_matrix_elements(self, bitstrings):
+        """Delegate to the shared helper in utils."""
+        from .utils import subspace_matrix_elements
+        return subspace_matrix_elements(self.hamiltonian, bitstrings)
 
     # ------------------------------------------------------------------
     # Fast solve

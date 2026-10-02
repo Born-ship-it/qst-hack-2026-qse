@@ -176,3 +176,120 @@ def compute_energy_error(estimated: float, exact: float) -> tuple[float, float]:
     abs_err = abs(estimated - exact)
     rel_err = abs_err / abs(exact) if exact != 0 else float("inf")
     return abs_err, rel_err
+
+
+# =====================================================================
+# Shared subspace helpers
+# =====================================================================
+
+def subspace_matrix_elements(
+    hamiltonian: SparsePauliOp,
+    bitstrings: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build the projected H and S matrices for a list of computational basis states.
+
+    This is the single source of truth used by SQDSolver, the sweep layer,
+    and the metrics layer. Do not duplicate elsewhere.
+
+    Parameters
+    ----------
+    hamiltonian : SparsePauliOp
+    bitstrings : list[str]
+        Basis states in Qiskit display convention (leftmost = highest qubit).
+
+    Returns
+    -------
+    h_mat : np.ndarray, shape (d, d), complex
+    s_mat : np.ndarray, shape (d, d), complex
+        `s_mat` is the identity because the basis is orthonormal.
+    """
+    dim = len(bitstrings)
+    h_mat = np.zeros((dim, dim), dtype=complex)
+    s_mat = np.eye(dim, dtype=complex)
+    n = hamiltonian.num_qubits
+
+    for i, bra_bs in enumerate(bitstrings):
+        for j, ket_bs in enumerate(bitstrings):
+            if i == j:
+                h_mat[i, j] = _diag_energy(hamiltonian, bra_bs)
+            else:
+                h_mat[i, j] = _off_diag_energy(hamiltonian, n, bra_bs, ket_bs)
+    return h_mat, s_mat
+
+
+def diagonalize_two_electron_subspace(
+    hamiltonian: SparsePauliOp,
+    num_electrons: int = 2,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """
+    Enumerate the n_electron subspace and diagonalize the Hamiltonian in it.
+
+    Parameters
+    ----------
+    hamiltonian : SparsePauliOp
+    num_electrons : int
+
+    Returns
+    -------
+    bitstrings : list[str]
+        Basis-state ordering, length = C(num_qubits, num_electrons).
+    evals : np.ndarray, shape (d,)
+        Sorted eigenvalues in the electronic frame.
+    evecs : np.ndarray, shape (d, d)
+        Columns are eigenvectors, matching `evals`.
+    """
+    from itertools import combinations
+
+    n = hamiltonian.num_qubits
+    bitstrings: list[str] = []
+    for occ in combinations(range(n), num_electrons):
+        bits = ["0"] * n
+        for q in occ:
+            bits[n - 1 - q] = "1"
+        bitstrings.append("".join(bits))
+
+    h_mat, _ = subspace_matrix_elements(hamiltonian, bitstrings)
+    h_mat = 0.5 * (h_mat + h_mat.conj().T)
+    evals, evecs = np.linalg.eigh(h_mat)
+    return bitstrings, evals, evecs
+
+
+def _diag_energy(op: SparsePauliOp, bitstring: str) -> complex:
+    state = int(bitstring, 2)
+    e = 0.0 + 0.0j
+    for pauli, coeff in zip(op.paulis, op.coeffs):
+        label = pauli.to_label()
+        if all(c in "IZ" for c in label):
+            sign = 1.0
+            for i, c in enumerate(reversed(label)):
+                if c == "Z":
+                    sign *= (-1.0) ** ((state >> i) & 1)
+            e += coeff * sign
+    return e
+
+
+def _off_diag_energy(
+    op: SparsePauliOp, n: int, bra_bs: str, ket_bs: str,
+) -> complex:
+    bra, ket = int(bra_bs, 2), int(ket_bs, 2)
+    val = 0.0 + 0.0j
+    for pauli, coeff in zip(op.paulis, op.coeffs):
+        label = pauli.to_label()
+        new_state = ket
+        phase = 1.0 + 0.0j
+        for q in range(n):
+            p = label[n - 1 - q]
+            if p == "I":
+                continue
+            elif p == "Z":
+                if (new_state >> q) & 1:
+                    phase *= -1
+            elif p == "X":
+                new_state ^= 1 << q
+            elif p == "Y":
+                phase *= 1j if not ((new_state >> q) & 1) else -1j
+                new_state ^= 1 << q
+        if new_state == bra:
+            val += coeff * phase
+    return val
