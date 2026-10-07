@@ -54,6 +54,16 @@ def parse_args() -> argparse.Namespace:
                    help="Comma-separated list of molecule names to prioritize")
     p.add_argument("--priority-only", action="store_true",
                    help="Run only priority molecules, ignore the rest")
+    p.add_argument(
+        "--algorithms", type=str,
+        default="QSE,SQD,SKQD",
+        help="Comma-separated list: QSE, SQD, SKQD",
+    )
+    p.add_argument(
+        "--layout", type=str, default="auto",
+        choices=["auto", "molecule_first", "method_first"],
+        help="Directory ordering under --data-dir",
+    )
     return p.parse_args()
 
 
@@ -63,6 +73,18 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+    
+    algorithms = tuple(
+        a.strip().upper() for a in args.algorithms.split(",") if a.strip()
+    )
+
+    KNOWN_ALGORITHMS = {"QSE", "SQD", "SKQD"}
+    unknown = set(algorithms) - KNOWN_ALGORITHMS
+    if unknown:
+        raise SystemExit(
+            f"Unknown algorithms: {unknown}. "
+            f"Valid choices: {sorted(KNOWN_ALGORITHMS)}"
+        )
 
     krylov_dims = tuple(
         range(args.krylov_min, args.krylov_max + 1, args.krylov_step)
@@ -74,7 +96,6 @@ def main() -> int:
     priority = tuple(
         s.strip() for s in args.priority.split(",") if s.strip()
     )
-
     config = BenchmarkConfig(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
@@ -90,6 +111,8 @@ def main() -> int:
         verbose=args.verbose,
         priority_systems=priority,
         priority_only=args.priority_only,
+        algorithms=algorithms,  
+        layout=args.layout,
     )
 
     runs_df, sweeps_df = run_benchmark(config)

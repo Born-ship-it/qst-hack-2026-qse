@@ -37,6 +37,7 @@ from .ovos_bridge import (
 )
 from .qse_baseline import QSESolver, run_baseline_qse
 from .sqd_enhanced import SQDSolver, run_sqd
+from .skqd import SKQDSolver, run_skqd, SKQDResult
 from .utils import (
     solve_thresholded_gevp,
     compute_exact_ground_state,
@@ -68,6 +69,9 @@ __all__ = [
     "run_baseline_qse",
     "SQDSolver",
     "run_sqd",
+    "SKQDSolver",
+    "run_skqd",
+    "SKQDResult",
     # Utils
     "solve_thresholded_gevp",
     "compute_exact_ground_state",

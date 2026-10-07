@@ -53,7 +53,8 @@ class ExactArtifact:
 def save_exact(base_dir: Path, run_key: str, art: ExactArtifact) -> Path:
     path = exact_path(base_dir, run_key)
     path.parent.mkdir(parents=True, exist_ok=True)
-    n_qubits = len(art.bitstrings[0]) if art.bitstrings else 0
+    # <U0 is invalid numpy dtype; use a minimum of 1
+    n_qubits = len(art.bitstrings[0]) if art.bitstrings else 1  # CHANGED
     np.savez_compressed(
         path,
         bitstrings=np.asarray(art.bitstrings, dtype=f"<U{n_qubits}"),
@@ -85,7 +86,7 @@ def load_exact(base_dir: Path, run_key: str) -> ExactArtifact:
 @dataclass
 class SweepArtifact:
     """
-    Raw intermediate data from a QSE or SQD sweep.
+    Raw intermediate data from a QSE, SQD, or SKQD sweep.
 
     Every array has a fixed shape so the .npz is portable.
 
@@ -93,10 +94,11 @@ class SweepArtifact:
     -------------------
     - ``coeffs``:      shape (K, max_R), zero-padded. ``coeff_lens`` gives
                        the true length of each vector.
-    - ``subspace_*``:  SQD only. ``subspace_index`` is (K, max_dim) with -1
-                       for padding; ``union_bitstrings`` holds the string
-                       pool. ``subspace_H``/``subspace_S`` are (K, max_dim,
-                       max_dim) with zero padding outside the valid block.
+    - ``subspace_*``:  SQD / SKQD only. ``subspace_index`` is (K, max_dim)
+                       with -1 for padding; ``union_bitstrings`` holds the
+                       string pool. ``subspace_H``/``subspace_S`` are
+                       (K, max_dim, max_dim) with zero padding outside the
+                       valid block.
     - ``sampled_counts``: (K, n_union) integer counts.
     """
     algorithm: str
@@ -111,7 +113,7 @@ class SweepArtifact:
     s_row: np.ndarray | None = None     # (max_R,), complex
     h_row: np.ndarray | None = None     # (max_R,), complex
 
-    # SQD-only
+    # SQD / SKQD-only
     union_bitstrings: np.ndarray | None = None    # (n_union,), '<U{n}'
     subspace_index: np.ndarray | None = None      # (K, max_dim), int, -1 padded
     subspace_sizes: np.ndarray | None = None      # (K,), int
@@ -177,7 +179,9 @@ def load_sweep(base_dir: Path, run_key: str, algorithm: str) -> SweepArtifact:
 # Padding helpers (used by sweeps.py)
 # =====================================================================
 
-def pad_coeffs(coeffs_list: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+def pack_coeffs(                                                     # RENAMED
+    coeffs_list: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
     """Pad a ragged list of coefficient vectors to a fixed-shape array."""
     K = len(coeffs_list)
     if K == 0:
@@ -186,6 +190,7 @@ def pad_coeffs(coeffs_list: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
     padded = np.zeros((K, max_R), dtype=complex)
     lens = np.zeros(K, dtype=int)
     for i, c in enumerate(coeffs_list):
+        c = np.asarray(c, dtype=complex)
         padded[i, : len(c)] = c
         lens[i] = len(c)
     return padded, lens
@@ -204,15 +209,16 @@ def pack_subspaces(
     sizes            : np.ndarray, shape (K,), int
     """
     union = sorted({bs for step in per_step_bitstrings for bs in step})
+    K = len(per_step_bitstrings)
     if not union:
         return (np.zeros(0, dtype="<U1"),
-                np.zeros((len(per_step_bitstrings), 0), dtype=int),
-                np.zeros(len(per_step_bitstrings), dtype=int))
-    bit_len = len(union[0])
+                np.zeros((K, 0), dtype=int),
+                np.zeros(K, dtype=int))
+    bit_len = max(len(bs) for bs in union)                            # CHANGED
     lookup = {bs: i for i, bs in enumerate(union)}
     max_dim = max((len(step) for step in per_step_bitstrings), default=0)
-    indices = np.full((len(per_step_bitstrings), max_dim), -1, dtype=int)
-    sizes = np.zeros(len(per_step_bitstrings), dtype=int)
+    indices = np.full((K, max_dim), -1, dtype=int)
+    sizes = np.zeros(K, dtype=int)
     for i, step in enumerate(per_step_bitstrings):
         indices[i, : len(step)] = [lookup[bs] for bs in step]
         sizes[i] = len(step)
@@ -238,13 +244,14 @@ def pack_counts(
     union_bitstrings: np.ndarray,
 ) -> np.ndarray:
     """Pack per-step count dicts into a (K, n_union) int64 matrix."""
+    K = len(per_step_counts)
     if union_bitstrings.size == 0:
-        return np.zeros((len(per_step_counts), 0), dtype=np.int64)
+        return np.zeros((K, 0), dtype=np.int64)
     lookup = {str(bs): i for i, bs in enumerate(union_bitstrings)}
-    out = np.zeros((len(per_step_counts), union_bitstrings.size), dtype=np.int64)
+    out = np.zeros((K, union_bitstrings.size), dtype=np.int64)
     for i, counts in enumerate(per_step_counts):
         for bs, c in counts.items():
             j = lookup.get(bs)
             if j is not None:
-                out[i, j] = c
+                out[i, j] = int(c)                                    # CHANGED
     return out

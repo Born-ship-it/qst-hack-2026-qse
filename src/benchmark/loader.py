@@ -80,7 +80,7 @@ def load_run(run: OrbitalRun, strict: bool = False) -> LoadedRun:
         ovos_to_qubit_problem(ovos)
     )
 
-    nuclear_repulsion = float(ovos.get("nuclear_repulsion_energy", 0.0))
+    nuclear_repulsion = _nuclear_repulsion(ovos, ref_energy)
     num_electrons = int(ovos.get("n_active_electrons", 2))
 
     # Build the reference circuit once
@@ -137,6 +137,23 @@ def _mp2_total(ovos: dict, nuclear_repulsion: float) -> float | None:
         return None
     return float(hf_elec) + float(mp2_corr) + nuclear_repulsion
 
+def _nuclear_repulsion(ovos: dict, ref_energy_elec: float) -> float:
+    """
+    Return the nuclear repulsion energy, inferring it if necessary.
+
+    Priority order:
+
+    1. ``nuclear_repulsion_energy`` — present in OVOS, AVAS, COVO.
+    2. ``hf_energy − ref_energy_elec`` — the JSON's total-frame HF minus
+       the electronic-frame reference computed from the integrals.
+    3. Zero — last resort; will produce warnings downstream if the
+       sanity check can be evaluated.
+    """
+    if "nuclear_repulsion_energy" in ovos:
+        return float(ovos["nuclear_repulsion_energy"])
+    if "hf_energy" in ovos:
+        return float(ovos["hf_energy"]) - ref_energy_elec
+    return 0.0
 
 def _optional_float(x) -> float | None:
     if x is None:

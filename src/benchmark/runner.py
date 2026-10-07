@@ -31,6 +31,7 @@ from .sweeps import (
     build_exact_artifact,
     run_qse_sweep,
     run_sqd_sweep,
+    run_skqd_sweep,
     synthesis_cache_path,
     synthesis_key,
 )
@@ -47,6 +48,7 @@ class BenchmarkConfig:
     data_dir: Path
     output_dir: Path
     methods: list[str] | None = None
+    algorithms: tuple[str, ...] = ("QSE", "SQD", "SKQD")
     krylov_dims: tuple[int, ...] = (2, 4, 6, 8, 10, 12)
     num_trotter_steps: int = 2
     trotter_order: int = 2
@@ -58,10 +60,9 @@ class BenchmarkConfig:
     workers: int = 1
     force: bool = False
     verbose: bool = False
-    # Points 11: prefer strongly-correlated systems
     priority_systems: tuple[str, ...] = ()
     priority_only: bool = False
-
+    layout: str = "auto"
 
 # =====================================================================
 # Entry point
@@ -85,7 +86,10 @@ def run_benchmark(config: BenchmarkConfig) -> tuple[pd.DataFrame, pd.DataFrame]:
             sweeps_path.unlink()
 
     # 1. Discover runs
-    all_runs = _filter_runs(discover_runs(config.data_dir), config)
+    all_runs = _filter_runs(
+        discover_runs(config.data_dir, layout=config.layout),
+        config,
+    )
     logger.info("Discovered %d JSON files under %s",
                 len(all_runs), config.data_dir)
     if not all_runs:
@@ -140,10 +144,49 @@ def _pre_synthesize(runs: list[OrbitalRun], config: BenchmarkConfig) -> None:
 
     This is the point-2 fix: workers can now assume cache hits, so they
     never write to the same .qpy concurrently.
+
+    Only the algorithms actually requested in ``config.algorithms`` are
+    synthesized. Previously this loop was hard-coded to QSE+SQD, which
+    (a) wasted time synthesizing QSE circuits the user did not ask for
+    and (b) crashed on the 12-qubit QSE circuit during a SQD-only run.
     """
     cache_dir = config.output_dir / "synthesis_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Pre-synthesizing %d runs × 2 algorithms", len(runs))
+
+    # Map algorithm name -> (cache tag, builder). SKQD reuses the SQD
+    # Trotter circuit, so it shares the "sqd" tag.
+    _BUILDERS: dict[str, tuple[str, Any]] = {
+        "QSE":  ("qse", _build_qse_circuit),
+        "SQD":  ("sqd", _build_sqd_circuit),
+        "SKQD": ("sqd", _build_sqd_circuit),
+    }
+
+    wanted = [a for a in config.algorithms if a in _BUILDERS]
+    unknown = [a for a in config.algorithms if a not in _BUILDERS]
+    if unknown:
+        raise ValueError(
+            f"Unknown algorithms in config.algorithms: {unknown}. "
+            f"Known: {sorted(_BUILDERS)}"
+        )
+
+    # Deduplicate tags so SKQD+SQD do not build the same circuit twice.
+    planned: list[tuple[str, Any]] = []
+    seen_tags: set[str] = set()
+    for algo in wanted:
+        tag, builder = _BUILDERS[algo]
+        if tag in seen_tags:
+            continue
+        seen_tags.add(tag)
+        planned.append((tag, builder))
+
+    logger.info(
+        "Pre-synthesizing %d runs × %d circuit(s) [%s]",
+        len(runs), len(planned),
+        ", ".join(tag for tag, _ in planned) or "none",
+    )
+    if not planned:
+        return
+
     t0 = time.time()
     for i, run in enumerate(runs, 1):
         try:
@@ -154,10 +197,7 @@ def _pre_synthesize(runs: list[OrbitalRun], config: BenchmarkConfig) -> None:
                 run.run_key, traceback.format_exc(),
             )
             continue
-        for tag, builder in (
-            ("qse", _build_qse_circuit),
-            ("sqd", _build_sqd_circuit),
-        ):
+        for tag, builder in planned:
             try:
                 circuit = builder(loaded, config)
             except Exception:
@@ -177,7 +217,6 @@ def _pre_synthesize(runs: list[OrbitalRun], config: BenchmarkConfig) -> None:
         if config.verbose or i % 5 == 0:
             logger.info("  [%d/%d] %s  (%.0fs)",
                         i, len(runs), run.run_key, time.time() - t0)
-
 
 def _build_qse_circuit(loaded, config) -> "QuantumCircuit":
     from ..qse_baseline import QSESolver
@@ -214,19 +253,31 @@ def _build_sqd_circuit(loaded, config) -> "QuantumCircuit":
     return qc
 
 
+import pickle  # add near the other stdlib imports
+
 def _write_synthesis(cache_file: Path, circuit, transpile_level: int) -> None:
-    """Transpile a circuit and write it atomically to the cache."""
-    from qiskit import qpy, transpile
-    from .sweeps import BASIS_GATES
+    """Cache the raw parameterized circuit with pickle.
+
+    We cache the *raw* circuit (PauliEvolution + reference prep), not a
+    transpiled one, so the pickle is small and the Statevector sweep
+    keeps PauliEvolutionGate intact and fast.  The earlier pickle
+    segfault was on transpiled circuits with thousands of instructions;
+    the raw circuit is tiny.
+
+    QASM3 is not used because it silently decomposes PauliEvolutionGate
+    via .definition, producing a huge expanded circuit that makes
+    Statevector evaluation pathologically slow at 12q and above.
+    """
+    import pickle
 
     logger.debug("  synthesizing %s", cache_file.name)
-    qc_synth = transpile(circuit, basis_gates=BASIS_GATES,
-                         optimization_level=transpile_level)
-    tmp = cache_file.with_suffix(".qpy.tmp")
+    pkl_file = cache_file.with_suffix(".pkl")
+    tmp = pkl_file.with_suffix(".pkl.tmp")
     with open(tmp, "wb") as f:
-        qpy.dump(qc_synth, f)
-    tmp.replace(cache_file)
-
+        pickle.dump(circuit, f, protocol=pickle.HIGHEST_PROTOCOL)
+    logger.debug("  wrote %s (%d bytes)",
+                 tmp.name, tmp.stat().st_size)
+    tmp.replace(pkl_file)
 
 # =====================================================================
 # Parallel / serial execution
@@ -270,10 +321,15 @@ def _run_parallel(runs, config):
 # =====================================================================
 
 def _process_one_run(run: OrbitalRun, config: BenchmarkConfig):
+    t0 = time.time()
     loaded = load_run(run, strict=config.strict_sanity)
+    logger.debug("  [timing] load_run: %.1fs", time.time() - t0)
 
+    t0 = time.time()
     save_exact(config.output_dir, run.run_key, build_exact_artifact(loaded))
+    logger.debug("  [timing] exact artifact: %.1fs", time.time() - t0)
 
+    t0 = time.time()
     res = measure_resources(
         loaded,
         num_trotter_steps=config.num_trotter_steps,
@@ -281,6 +337,7 @@ def _process_one_run(run: OrbitalRun, config: BenchmarkConfig):
         transpile_level=config.transpile_level,
     )
     acc = measure_accuracy(loaded)
+    logger.debug("  [timing] measure_resources: %.1fs", time.time() - t0)
 
     runs_row = {
         "run_key": run.run_key,
@@ -293,33 +350,55 @@ def _process_one_run(run: OrbitalRun, config: BenchmarkConfig):
         **acc.to_row(),
     }
 
-    qse_rows, qse_art = run_qse_sweep(
-        loaded,
-        krylov_dims=config.krylov_dims,
-        num_trotter_steps=config.num_trotter_steps,
-        trotter_order=config.trotter_order,
-        threshold=config.threshold_qse,
-        transpile_level=config.transpile_level,
-        cache_dir=config.output_dir / "synthesis_cache",
-        verbose=config.verbose,
-    )
-    save_sweep(config.output_dir, run.run_key, qse_art)
+    if "QSE" in config.algorithms:
+        qse_rows, qse_art = run_qse_sweep(
+            loaded,
+            krylov_dims=config.krylov_dims,
+            num_trotter_steps=config.num_trotter_steps,
+            trotter_order=config.trotter_order,
+            threshold=config.threshold_qse,
+            transpile_level=config.transpile_level,
+            cache_dir=config.output_dir / "synthesis_cache",
+            verbose=config.verbose,
+        )
+        save_sweep(config.output_dir, run.run_key, qse_art)
+    else:
+        qse_rows = []
 
-    sqd_rows, sqd_art = run_sqd_sweep(
-        loaded,
-        krylov_dims=config.krylov_dims,
-        num_trotter_steps=config.num_trotter_steps,
-        trotter_order=config.trotter_order,
-        num_samples=config.num_samples,
-        threshold=config.threshold_sqd,
-        transpile_level=config.transpile_level,
-        cache_dir=config.output_dir / "synthesis_cache",
-        verbose=config.verbose,
-    )
-    save_sweep(config.output_dir, run.run_key, sqd_art)
+    if "SQD" in config.algorithms:
+        sqd_rows, sqd_art = run_sqd_sweep(
+            loaded,
+            krylov_dims=config.krylov_dims,
+            num_trotter_steps=config.num_trotter_steps,
+            trotter_order=config.trotter_order,
+            num_samples=config.num_samples,
+            threshold=config.threshold_sqd,
+            transpile_level=config.transpile_level,
+            cache_dir=config.output_dir / "synthesis_cache",
+            verbose=config.verbose,
+        )
+        save_sweep(config.output_dir, run.run_key, sqd_art)
+    else:
+        sqd_rows = []
+
+    if "SKQD" in config.algorithms:
+        skqd_rows, skqd_art = run_skqd_sweep(
+            loaded,
+            krylov_dims=config.krylov_dims,
+            num_trotter_steps=config.num_trotter_steps,
+            trotter_order=config.trotter_order,
+            num_samples_per_k=config.num_samples,
+            threshold=config.threshold_sqd,
+            transpile_level=config.transpile_level,
+            cache_dir=config.output_dir / "synthesis_cache",
+            verbose=config.verbose,
+        )
+        save_sweep(config.output_dir, run.run_key, skqd_art)
+    else:
+        skqd_rows = []
 
     sweep_rows = []
-    for row in (*qse_rows, *sqd_rows):
+    for row in (*qse_rows, *sqd_rows, *skqd_rows):
         d = row.to_row()
         d["method"] = run.method
         d["config"] = run.config

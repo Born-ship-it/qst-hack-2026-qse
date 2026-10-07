@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import time
 from dataclasses import asdict, dataclass
 
@@ -13,6 +15,7 @@ from qiskit.synthesis import LieTrotter, SuzukiTrotter
 
 from .loader import LoadedRun
 
+logger = logging.getLogger(__name__)
 
 BASIS_GATES = ["rz", "sx", "x", "cx"]
 
@@ -48,6 +51,24 @@ def measure_resources(
     can be applied once and the resulting gate counts are directly meaningful
     for hardware-cost estimation.
     """
+    if loaded.num_qubits > 12:
+        logger.warning(
+            "measure_resources: skipping transpile at %dq (>12q); "
+            "reporting raw circuit stats only",
+            loaded.num_qubits,
+        )
+        return ResourceMetrics(
+            num_qubits=loaded.num_qubits,
+            num_pauli_terms=len(loaded.hamiltonian),
+            num_commuting_groups=0,
+            trotter_depth=0,
+            trotter_2q_gates=0,
+            trotter_1q_gates=0,
+            pauli_max_locality=0,
+            pauli_mean_locality=0.0,
+            synthesis_seconds=0.0,
+        )
+        
     hamiltonian = loaded.hamiltonian
     num_qubits = hamiltonian.num_qubits
     num_terms = len(hamiltonian.paulis)

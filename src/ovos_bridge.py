@@ -25,6 +25,34 @@ import numpy as np
 from qiskit.quantum_info import SparsePauliOp
 
 
+
+# =====================================================================
+# Internal helpers
+# =====================================================================
+
+def _diag_energy(pauli_op, bitstring: str) -> float:
+    """<bitstring|H|bitstring> for a SparsePauliOp, vectorized.
+
+    Only Z-only Pauli terms contribute; everything else is off-diagonal
+    in the computational basis and gives 0. The surviving phase is
+    (-1)^popcount(z_mask & b).
+    """
+    n = pauli_op.num_qubits
+    # Qiskit's to_label() reads qubit 0 as the leftmost character.
+    # Pauli.x / Pauli.z index qubit q along axis 1.
+    bits = np.frombuffer(bitstring.encode(), dtype=np.uint8) - ord('0')
+    bits = bits.astype(bool)                # shape (n,), qubit 0 first
+
+    x = pauli_op.paulis.x                   # (N, n) bool
+    z = pauli_op.paulis.z                   # (N, n) bool
+    coeffs = pauli_op.coeffs                # (N,) complex
+
+    diagonal = ~x.any(axis=1)               # (N,) bool, True for Z-only terms
+    parity = (z & bits).sum(axis=1) & 1     # (N,) int
+    signs = 1.0 - 2.0 * parity              # (N,) float
+
+    return float(np.sum(coeffs.real * signs * diagonal))
+
 # =====================================================================
 # Loading
 # =====================================================================
@@ -45,50 +73,54 @@ def ovos_to_qubit_problem(
     transpose_h2: bool = False,
 ) -> tuple[SparsePauliOp, int, str, float, float]:
     """
-    Convert OVOS data into a qubit Hamiltonian plus the HF reference.
+    Convert evaluator JSON into a qubit Hamiltonian plus HF reference.
 
-    Parameters
-    ----------
-    ovos_data : dict
-        Dictionary returned by ``load_ovos_data``.
-    mapper_name : str
-        ``"jordan_wigner"`` (default), ``"parity"``, or ``"bravyi_kitaev"``.
-    transpose_h2 : bool
-        Set to True if the two-electron integrals use physicist notation
-        (⟨pr|qs⟩) rather than chemist notation ((pq|rs)).
+    Handles two schema variants emitted by the evaluator:
+
+    - Full schema (OVOS, COVO): has ``n_active_occ``, ``n_active_vir``
+      and ``active_hf_energy``.  The HF reference is auto-detected by
+      matching ``<bs|H|bs>`` against ``active_hf_energy``.
+    - Reduced schema (baseline, no_mp2): omits those three keys.  We
+      derive ``n_active_occ = n_active_electrons // 2`` (closed shell),
+      ``n_active_vir = n_orb - n_occ``, and construct the HF bitstring
+      from the blocked spin-orbital ordering used by ``qiskit-nature``.
 
     Returns
     -------
     hamiltonian : SparsePauliOp
     num_qubits : int
     ref_bitstring : str
-        HF reference in Qiskit's display convention (leftmost = highest).
+        HF reference in Qiskit display convention (leftmost = highest).
     ref_energy : float
-        Active-space HF energy in the *electronic* frame (no nuclear repulsion).
+        ``<ref|H|ref>`` in the *electronic* frame (no nuclear repulsion).
     vacuum_energy : float
-        <0…0|H|0…0> — the constant shift the control-free swap test cancels.
+        ``<0...0|H|0...0>``, the constant shift cancelled by the
+        control-free swap test.
     """
-    # --- Validate -------------------------------------------------------
+    # --- Minimal required fields ---
     required = [
-        "n_active_occ", "n_active_vir", "n_active_electrons",
-        "one_electron_integrals", "two_electron_integrals",
-        "active_hf_energy",
+        "n_active_electrons",
+        "n_active_orbitals",
+        "one_electron_integrals",
+        "two_electron_integrals",
     ]
     missing = [k for k in required if k not in ovos_data]
     if missing:
-        raise ValueError(f"OVOS data missing required fields: {missing}")
+        raise ValueError(
+            f"JSON data missing required fields: {missing}. "
+            f"Available keys: {sorted(ovos_data.keys())}"
+        )
 
-    # --- Integrals ------------------------------------------------------
+    # --- Integrals ---
     h1 = np.asarray(ovos_data["one_electron_integrals"], dtype=float)
     h2 = np.asarray(ovos_data["two_electron_integrals"], dtype=float)
     if transpose_h2:
         h2 = h2.transpose(0, 2, 1, 3)
 
-    n_occ = int(ovos_data["n_active_occ"])
-    n_vir = int(ovos_data["n_active_vir"])
-    n_orb = n_occ + n_vir
+    n_orb = int(ovos_data["n_active_orbitals"])
+    n_electrons = int(ovos_data["n_active_electrons"])
 
-    # --- Build fermionic operator --------------------------------------
+    # --- Build fermionic operator ---
     from qiskit_nature.second_q.hamiltonians import ElectronicEnergy
     from qiskit_nature.second_q.mappers import (
         BravyiKitaevMapper,
@@ -96,14 +128,10 @@ def ovos_to_qubit_problem(
         ParityMapper,
     )
 
-    # Restricted closed-shell → all spin blocks identical
-    energy_op = ElectronicEnergy.from_raw_integrals(
-        h1, h2,
-        h1, h2, h2,
-    )
+    energy_op = ElectronicEnergy.from_raw_integrals(h1, h2, h1, h2, h2)
     fermionic_op = energy_op.second_q_op()
 
-    # --- Map to qubits --------------------------------------------------
+    # --- Map to qubits ---
     mapper_name = mapper_name.lower().replace("-", "_")
     if mapper_name in ("jordan_wigner", "jw"):
         mapper = JordanWignerMapper()
@@ -119,18 +147,23 @@ def ovos_to_qubit_problem(
         qubit_op = SparsePauliOp.from_list(qubit_op.to_list()).simplify()
 
     num_qubits = qubit_op.num_qubits
-    n_electrons = int(ovos_data["n_active_electrons"])
-    target_hf = float(ovos_data["active_hf_energy"])
 
-    # --- Auto-detect HF bitstring --------------------------------------
-    ref_bitstring, diff = find_hf_bitstring(
-        qubit_op, target_hf, n_electrons,
-    )
-    if diff > 1e-6:
-        raise RuntimeError(
-            f"No {n_electrons}-electron configuration matches OVOS HF energy "
-            f"({target_hf:.8f} Ha). Best was |{ref_bitstring}> with diff "
-            f"{diff:.2e} Ha. Try transpose_h2=True."
+    # --- HF reference bitstring ---
+    target_hf = ovos_data.get("active_hf_energy")
+    if target_hf is not None:
+        ref_bitstring, diff = find_hf_bitstring(
+            qubit_op, float(target_hf), n_electrons,
+        )
+        if diff > 1e-6:
+            raise RuntimeError(
+                f"No {n_electrons}-electron configuration matches "
+                f"active_hf_energy ({target_hf:.8f} Ha). Best was "
+                f"|{ref_bitstring}> with diff {diff:.2e} Ha. "
+                f"Try transpose_h2=True."
+            )
+    else:
+        ref_bitstring = _structural_hf_bitstring(
+            num_qubits, n_electrons, n_orb,
         )
 
     ref_energy = _diag_energy(qubit_op, ref_bitstring)
@@ -140,55 +173,62 @@ def ovos_to_qubit_problem(
 
 
 # =====================================================================
-# HF auto-detection
+# Structural fallback for reduced-schema JSONs
 # =====================================================================
 
+def _structural_hf_bitstring(
+    num_qubits: int,
+    n_electrons: int,
+    n_active_orbitals: int,
+) -> str:
+    """
+    Blocked-order HF reference for a closed-shell RHF calculation.
+
+    ``qiskit-nature``'s ``ElectronicEnergy`` uses blocked spin-orbital
+    ordering: spin orbitals ``0 .. n_orb - 1`` are alpha, ``n_orb ..``
+    are beta.  The HF determinant occupies the lowest ``n_alpha`` alpha
+    orbitals and the lowest ``n_beta`` beta orbitals.
+
+    Qiskit bitstring convention: leftmost character = highest qubit.
+    """
+    n_occ_alpha = n_electrons // 2
+    n_occ_beta = n_electrons - n_occ_alpha
+
+    bits = ["0"] * num_qubits
+    for i in range(n_occ_alpha):
+        bits[num_qubits - 1 - i] = "1"
+    for i in range(n_occ_beta):
+        bits[num_qubits - 1 - (n_active_orbitals + i)] = "1"
+    return "".join(bits)
+
+# =====================================================================
+# HF auto-detection
+# =====================================================================
 def find_hf_bitstring(
-    hamiltonian: SparsePauliOp,
-    target_energy: float,
+    qubit_op: SparsePauliOp,
+    target_hf_energy: float,
     n_electrons: int,
 ) -> tuple[str, float]:
-    """
-    Find the computational basis state whose <bs|H|bs> best matches
-    ``target_energy``.
+    """Brute-force the N-electron computational basis state whose diagonal
+    energy is closest to ``target_hf_energy``.
 
-    Returns
-    -------
-    bitstring : str
-        In Qiskit's display convention (leftmost = highest qubit).
-    diff : float
-        |<bs|H|bs> - target_energy|.
+    With the vectorized ``_diag_energy`` this is ~C(n, k) * 10 µs, i.e.
+    tens of milliseconds even for C(14, 8) = 3005. The old form was slow
+    only because ``Pauli.to_label()`` was called per term per candidate.
     """
-    num_qubits = hamiltonian.num_qubits
+    num_qubits = qubit_op.num_qubits
 
-    best_bs, best_diff = None, float("inf")
+    best_bs = None
+    best_diff = float("inf")
     for occ in combinations(range(num_qubits), n_electrons):
         bits = ["0"] * num_qubits
         for q in occ:
-            bits[num_qubits - 1 - q] = "1"
+            bits[q] = "1"           # position q in the string == qubit q
         bs = "".join(bits)
-
-        diff = abs(_diag_energy(hamiltonian, bs) - target_energy)
-        if diff < best_diff:
-            best_diff, best_bs = diff, bs
-
+        d = abs(_diag_energy(qubit_op, bs) - target_hf_energy)
+        if d < best_diff:
+            best_diff = d
+            best_bs = bs
+            if d < 1e-12:
+                break
     return best_bs, best_diff
-
-
-# =====================================================================
-# Internal helpers
-# =====================================================================
-
-def _diag_energy(op: SparsePauliOp, bitstring: str) -> float:
-    """<bitstring|H|bitstring> (diagonal Pauli terms only)."""
-    state = int(bitstring, 2)
-    energy = 0.0
-    for pauli, coeff in zip(op.paulis, op.coeffs):
-        label = pauli.to_label()
-        if all(c in "IZ" for c in label):
-            sign = 1.0
-            for i, c in enumerate(reversed(label)):
-                if c == "Z":
-                    sign *= (-1.0) ** ((state >> i) & 1)
-            energy += coeff.real * sign
-    return energy

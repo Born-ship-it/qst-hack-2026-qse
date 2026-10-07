@@ -20,6 +20,7 @@ from .style import (
     method_color,
     save_figure,
     style_axes,
+    algo_marker,
 )
 
 
@@ -291,11 +292,13 @@ def fig08_pareto_frontier(
     fig, ax = plt.subplots(figsize=(8, 6))
     for method, sub in merged.groupby("method"):
         for algo, algo_sub in sub.groupby("algorithm"):
-            ax.scatter(algo_sub["cost"], algo_sub["err_vs_fci_mha"],
-                       color=method_color(method),
-                       marker="o" if algo == "QSE" else "s",
-                       s=40, alpha=0.7,
-                       label=f"{method}·{algo}")
+            ax.scatter(
+                algo_sub["cost"], algo_sub["err_vs_fci_mha"],
+                color=method_color(method),
+                marker=algo_marker(algo),
+                s=40, alpha=0.7,
+                label=f"{method}\u00b7{algo}",
+            )
     # Pareto frontier
     df = merged.sort_values("cost").reset_index(drop=True)
     pareto = []

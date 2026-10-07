@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-from qiskit import QuantumCircuit, qpy, transpile
+from qiskit import QuantumCircuit, transpile
 from qiskit.circuit import Parameter
 from qiskit.quantum_info import Statevector
 
@@ -34,7 +34,7 @@ from .loader import LoadedRun
 
 BASIS_GATES = ["rz", "sx", "x", "cx"]
 DEFAULT_CACHE_DIR = Path(".cache/synthesis")
-
+MAX_SQD_SUBSPACE = 2000   # cap on union of sampled bitstrings; standard SQD practice
 
 # =====================================================================
 # Row schemas
@@ -228,10 +228,14 @@ def run_sqd_sweep(
         num_trotter_steps=num_trotter_steps,
         order=trotter_order, parameterized=True,
     )
+    params = sorted(evolution.parameters, key=lambda p: p.name)
+    if len(params) != 1:
+        raise ValueError(
+            f"build_trotter_circuit returned {len(params)} parameters; "
+            f"expected 1."
+        )
     t_sqd = Parameter("t_sqd")
-    evolution = evolution.assign_parameters(
-        {list(evolution.parameters)[0]: t_sqd}
-    )
+    evolution = evolution.assign_parameters({params[0]: t_sqd})
     qc = QuantumCircuit(loaded.num_qubits)
     qc.compose(loaded.reference_circuit, inplace=True)
     qc.compose(evolution, inplace=True)
@@ -241,6 +245,13 @@ def run_sqd_sweep(
         key=_synth_key(loaded, "sqd", num_trotter_steps, trotter_order, transpile_level),
         cache_dir=cache_dir, transpile_level=transpile_level, verbose=verbose,
     )
+    if len(qc_synth.parameters) != 1:
+        raise RuntimeError(
+            f"cached SQD circuit for {loaded.meta.run_key} has "
+            f"{len(qc_synth.parameters)} parameters; expected 1. "
+            f"Delete {cache_dir} and rerun."
+        )
+    t_param = next(iter(qc_synth.parameters))
 
     rng = np.random.default_rng(seed)
     all_bitstrings: set[str] = set()
@@ -259,7 +270,7 @@ def run_sqd_sweep(
 
     for d in range(1, max_r):
         t_d = time.time()
-        bound = qc_synth.assign_parameters({t_sqd: d * solver.dt})
+        bound = qc_synth.assign_parameters({t_param: d * solver.dt})
         psi = Statevector(bound)
         probs = psi.probabilities_dict()
         keys = list(probs.keys())
@@ -274,7 +285,12 @@ def run_sqd_sweep(
         if (d + 1) not in requested:
             continue
 
-        bitstrings = sorted(all_bitstrings)
+        if len(all_bitstrings) > MAX_SQD_SUBSPACE:
+            keep = [bs for bs, _ in aggregated_counts.most_common(MAX_SQD_SUBSPACE)]
+            bitstrings = sorted(keep)
+        else:
+            bitstrings = sorted(all_bitstrings)
+
         h_mat, s_mat = subspace_matrix_elements(loaded.hamiltonian, bitstrings)
         cond = _condition_number(s_mat)
         try:
@@ -323,15 +339,153 @@ def run_sqd_sweep(
     )
     return rows, artifact
 
+def run_skqd_sweep(
+    loaded: LoadedRun,
+    krylov_dims: Iterable[int],
+    num_trotter_steps: int = 2,
+    trotter_order: int = 2,
+    num_samples_per_k: int = 20_000,
+    threshold: float = 1e-8,
+    seed: int = 42,
+    transpile_level: int = 1,
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    verbose: bool = False,
+) -> tuple[list[SQDRow], SweepArtifact]:
+    """
+    Cumulative SKQD sweep: sample from d Krylov states, union the
+    sampled bitstrings, project H, diagonalize.
+
+    Reuses the SQD synthesis cache because the parameterized circuit
+    (reference prep + Trotter step) is identical for both algorithms.
+
+    ``krylov_dims`` gives the values of d to record.  For each d, the
+    subspace is the union of samples from k = 0, 1, ..., d-1.
+    """
+    krylov_dims = sorted(krylov_dims)
+    max_d = max(krylov_dims)
+
+    # Reuse the SQD circuit shape
+    from ..skqd import SKQDSolver
+
+    solver_circuit = SKQDSolver(
+        hamiltonian=loaded.hamiltonian,
+        reference_circuit=loaded.reference_circuit,
+        reference_bitstring=loaded.ref_bitstring,
+        krylov_dim=max_d,
+        num_trotter_steps=num_trotter_steps,
+        trotter_order=trotter_order,
+        num_samples_per_k=num_samples_per_k,
+        threshold=threshold,
+        seed=seed,
+    )
+    circuit = solver_circuit._build_parameterized_circuit()
+    qc_synth = _load_or_build_synthesis(
+        circuit,
+        key=_synth_key(loaded, "sqd", num_trotter_steps,
+                       trotter_order, transpile_level),
+        cache_dir=cache_dir,
+        transpile_level=transpile_level,
+        verbose=verbose,
+    )
+    t_param = sorted(qc_synth.parameters, key=lambda p: p.name)[0]
+
+    rng = np.random.default_rng(seed)
+    all_bitstrings: set[str] = set()
+    aggregated_counts: Counter = Counter()
+
+    rows: list[SQDRow] = []
+    energies: list[float] = []
+    coeffs_list: list[np.ndarray] = []
+    conds: list[float] = []
+    retained_list: list[int] = []
+    per_step_bs: list[list[str]] = []
+    per_step_H: list[np.ndarray] = []
+    per_step_S: list[np.ndarray] = []
+    per_step_counts: list[dict[str, int]] = []
+    requested = set(krylov_dims)
+
+    dt = loaded.dt
+
+    for k in range(max_d):
+        t0 = time.time()
+        bound = qc_synth.assign_parameters({t_param: k * dt})
+        psi = Statevector(bound)
+        probs = psi.probabilities_dict()
+        keys = list(probs.keys())
+        vals = np.array([probs[kk] for kk in keys])
+        vals = vals / vals.sum()
+        sampled = rng.choice(keys, size=num_samples_per_k, p=vals)
+        counts = Counter(sampled)
+        all_bitstrings.update(counts.keys())
+        aggregated_counts.update(counts)
+        d_seconds = time.time() - t0
+
+        d_target = k + 1
+        if d_target not in requested:
+            continue
+
+        if len(all_bitstrings) > MAX_SQD_SUBSPACE:
+            keep = [bs for bs, _ in aggregated_counts.most_common(MAX_SQD_SUBSPACE)]
+            bitstrings = sorted(keep)
+        else:
+            bitstrings = sorted(all_bitstrings)
+            
+        h_mat, s_mat = subspace_matrix_elements(
+            loaded.hamiltonian, bitstrings,
+        )
+        cond = _condition_number(s_mat)
+        try:
+            e_elec, coeffs, retained = solve_thresholded_gevp(
+                h_mat, s_mat, threshold=threshold,
+            )
+            e_total = e_elec + loaded.nuclear_repulsion
+        except ValueError:
+            e_total = float("nan")
+            coeffs = np.array([])
+            retained = 0
+
+        rows.append(_make_row(
+            loaded, "SKQD", d_target, e_total, cond, retained,
+            subspace_dim=len(bitstrings), runtime=d_seconds,
+        ))
+        energies.append(e_total)
+        coeffs_list.append(coeffs)
+        conds.append(cond)
+        retained_list.append(retained)
+        per_step_bs.append(bitstrings)
+        per_step_H.append(h_mat)
+        per_step_S.append(s_mat)
+        per_step_counts.append(dict(aggregated_counts))
+
+    coeffs_padded, coeff_lens = pack_coeffs(coeffs_list)
+    union_bs, subspace_index, subspace_sizes = pack_subspaces(per_step_bs)
+    subspace_H = pack_matrices(per_step_H)
+    subspace_S = pack_matrices(per_step_S)
+    counts_matrix = pack_counts(per_step_counts, union_bs)
+
+    artifact = SweepArtifact(
+        algorithm="SKQD",
+        krylov_dims=np.asarray(krylov_dims),
+        energies_total=np.asarray(energies),
+        condition_numbers=np.asarray(conds),
+        retained_dims=np.asarray(retained_list),
+        coeffs=coeffs_padded,
+        coeff_lens=coeff_lens,
+        union_bitstrings=union_bs,
+        subspace_index=subspace_index,
+        subspace_sizes=subspace_sizes,
+        subspace_H=subspace_H,
+        subspace_S=subspace_S,
+        sampled_counts=counts_matrix,
+    )
+    return rows, artifact
 
 # =====================================================================
 # Synthesis cache
 # =====================================================================
 
-def synthesis_cache_path(
-    cache_dir: Path, key: str,
-) -> Path:
-    return cache_dir / f"{key}.qpy"
+def synthesis_cache_path(cache_dir: Path, key: str) -> Path:
+    return cache_dir / f"{key}.pkl"
 
 
 def synthesis_key(
@@ -353,32 +507,29 @@ def _load_or_build_synthesis(
     circuit: QuantumCircuit, key: str, cache_dir: Path,
     transpile_level: int, verbose: bool,
 ) -> QuantumCircuit:
-    """Load a cached Trotter circuit, synthesizing and caching if needed.
+    import pickle
 
-    Callers must serialize access to the cache directory; see runner.py
-    for the pre-synthesis pass that guarantees this.
-    """
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = synthesis_cache_path(cache_dir, key)
+
     if cache_file.exists():
         if verbose:
             print(f"    [cache hit] {cache_file.name}")
         with open(cache_file, "rb") as f:
-            return qpy.load(f)[0]
+            return pickle.load(f)
+
     if verbose:
-        print(f"    [synthesizing] {key}")
+        print(f"    [caching raw] {key}")
     t0 = time.time()
-    qc_synth = transpile(circuit, basis_gates=BASIS_GATES,
-                         optimization_level=transpile_level)
-    if verbose:
-        print(f"      → {time.time() - t0:.1f}s, "
-              f"depth {qc_synth.depth()}, size {qc_synth.size()}")
-    # Atomic write: write to a tmp file then rename
-    tmp = cache_file.with_suffix(".qpy.tmp")
+    tmp = cache_file.with_suffix(".pkl.tmp")
     with open(tmp, "wb") as f:
-        qpy.dump(qc_synth, f)
+        pickle.dump(circuit, f, protocol=pickle.HIGHEST_PROTOCOL)
     tmp.replace(cache_file)
-    return qc_synth
+    if verbose:
+        print(f"      → {time.time() - t0:.3f}s, "
+              f"depth {circuit.depth()}, size {circuit.size()}, "
+              f"params {sorted(p.name for p in circuit.parameters)}")
+    return circuitz
 
 
 # =====================================================================
@@ -390,7 +541,18 @@ def _toeplitz(first_row: np.ndarray) -> np.ndarray:
     return la.toeplitz(first_row.conj(), first_row)
 
 
-def _condition_number(s_mat: np.ndarray) -> float:
+def _condition_number(s_mat) -> float:
+    """Condition number of the overlap matrix.
+
+    Handles both dense and sparse input. S is the identity in this
+    codebase (orthonormal computational basis), so the sparse path
+    short-circuits to 1.0 — no need to iterate eigenvalues of I.
+    """
+    from scipy.sparse import issparse
+    if issparse(s_mat):
+        # S == I here, cond(I) == 1
+        return 1.0
+
     vals = np.linalg.eigvalsh(0.5 * (s_mat + s_mat.conj().T))
     pos = vals[vals > 1e-12]
     if len(pos) < 2:
